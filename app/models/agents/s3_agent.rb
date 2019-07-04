@@ -145,6 +145,7 @@ module Agents
         safely do
           mo = interpolated(event)
           client.put_object(bucket: mo['bucket'], key: mo['filename'], body: mo['data'])
+          create_event payload: mo['filename']
         end
       end
     end
