@@ -426,7 +426,9 @@ module Agents
       if extract_full_json?
         if store_payload!(previous_payloads(1), doc)
           log "Storing new result for '#{name}': #{doc.inspect}"
-          create_event payload: existing_payload.merge(doc)
+          payload = existing_payload.merge(doc)
+          payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
+          create_event payload: payload
         end
         return
       end
@@ -457,7 +459,9 @@ module Agents
 
         if store_payload!(old_events, result)
           log "Storing new parsed result for '#{name}': #{result.inspect}"
-          create_event payload: existing_payload.merge(result)
+          payload = existing_payload.merge(result)
+          payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
+          create_event payload: payload
         end
       end
     end
