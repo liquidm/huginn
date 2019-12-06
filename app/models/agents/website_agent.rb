@@ -1,5 +1,6 @@
 require 'nokogiri'
 require 'date'
+require 'json'
 
 module Agents
   class WebsiteAgent < Agent
@@ -19,7 +20,7 @@ module Agents
 
       Specify a `url` and select a `mode` for when to create Events based on the scraped data, either `all`, `on_change`, or `merge` (if fetching based on an Event, see below).
 
-      The `url` option can be a single url, or an array of urls (for example, for multiple pages with the exact same structure but different content to scrape).
+      The `url` option can be a single url, or an array of urls (for example, for multiple pages with the exact same structure but different content to scrape). Set optional post_body to use POST instead of GET.
 
       The WebsiteAgent can also scrape based on incoming events.
 
@@ -177,7 +178,7 @@ module Agents
             "last_modified": "{{ _response_.headers.Last-Modified | date: '%FT%T' }}"
           }
 
-      In the `on_change` mode, change is detected based on the resulted event payload after applying this option.  If you want to add some keys to each event but ignore any change in them, set `mode` to `all` and put a DeDuplicationAgent downstream.
+      In the `on_change` mode, change is detected based on the resulted event payload after applying this option.  If you want to add some keys to each event but ignore any change in them, set `mode` to `all` and put a DeDuplicationAgent downstream. If you want to limit the keys used for the event comparison set uniqueness_keys array.
 
       # Liquid Templating
 
@@ -376,27 +377,27 @@ module Agents
     end
 
     def check
-      check_urls(interpolated['url'])
+      check_urls(interpolated['url'], interpolated['post_body'])
     end
 
-    def check_urls(in_url, existing_payload = {})
+    def check_urls(in_url, in_post_body = '', existing_payload = {})
       return unless in_url.present?
 
-      Array(in_url).each do |url|
-        check_url(url, existing_payload)
-      end
+      post_bodies = Array(in_post_body)
+      Array(in_url).each_with_index { |url, i |
+        check_url(url, post_bodies[i], existing_payload)
+      }
+
     end
 
-    def check_url(url, existing_payload = {})
-      unless /\Ahttps?:\/\//i === url
-        error "Ignoring a non-HTTP url: #{url.inspect}"
-        return
-      end
+    def check_url(url, post_body, existing_payload = {})
       uri = Utils.normalize_uri(url)
-      log "Fetching #{uri}"
-      response = faraday.get(uri)
+      log "Fetching #{uri}\n#{post_body}"
+      response = post_body.blank? ? faraday.get(uri) : faraday.post(uri, post_body.is_a?(Hash) ? JSON.generate(post_body) : post_body)
 
       raise "Failed: #{response.inspect}" unless consider_response_successful?(response)
+
+      log "Response #{response.body}"
 
       interpolation_context.stack {
         interpolation_context['_url_'] = uri.to_s
@@ -480,7 +481,13 @@ module Agents
               else
                 interpolated['url']
               end
-            check_urls(url_to_scrape, existing_payload)
+            post_body =
+              if body_template = options['post_body_from_event'].presence
+                interpolate_options(body_template)
+              else
+                interpolated['post_body']
+              end
+            check_urls(url_to_scrape, post_body, existing_payload)
           end
         end
       end
@@ -510,7 +517,15 @@ module Agents
       case interpolated['mode'].presence
       when 'on_change'
         result_json = result.to_json
-        if found = old_events.find { |event| event.payload.to_json == result_json }
+        if options['uniqueness_keys']
+          found = old_events.find { |event|
+            event.payload.select{ |key| options['uniqueness_keys'].include? key.to_s } ==
+                result.select{ |key| options['uniqueness_keys'].include? key.to_s }
+          }
+        else
+          found = old_events.find { |event| event.payload.to_json == result_json }
+        end
+        if found
           found.update!(expires_at: new_event_expiration_date)
           false
         else
