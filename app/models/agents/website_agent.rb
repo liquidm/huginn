@@ -1,6 +1,7 @@
 require 'nokogiri'
 require 'date'
 require 'json'
+require 'pg'
 
 module Agents
   class WebsiteAgent < Agent
@@ -393,19 +394,42 @@ module Agents
     def check_url(url, post_body, existing_payload = {})
       uri = Utils.normalize_uri(url)
       log "Fetching #{uri}\n#{post_body}"
-      response = post_body.blank? ? faraday.get(uri) : faraday.post(uri, post_body.is_a?(Hash) ? JSON.generate(post_body) : post_body)
-
-      raise "Failed: #{response.inspect}" unless consider_response_successful?(response)
-
-      log "Response #{response.body}"
-
-      interpolation_context.stack {
-        interpolation_context['_url_'] = uri.to_s
-        interpolation_context['_response_'] = ResponseDrop.new(response)
-        handle_data(response.body, response.env[:url], existing_payload)
-      }
+      if uri.to_s.start_with?("postgresql://")
+        response = {status: 200, headers: {}, body: []}
+        get_pg_connection(uri.to_s).exec(post_body[:query]) do |result|
+          result.each do |row|
+            response[:body] << row
+          end
+        end
+        interpolation_context.stack {
+          interpolation_context['_url_'] = uri.to_s
+          interpolation_context['_response_'] = response
+          handle_data(response[:body].to_json, uri.to_s, existing_payload)
+        }
+      else
+        response = post_body.blank? ? faraday.get(uri) : faraday.post(uri, post_body.is_a?(Hash) ? JSON.generate(post_body) : post_body)
+        raise "Failed: #{response.inspect}" unless consider_response_successful?(response)
+        log "Response #{response.body}"
+        interpolation_context.stack {
+          interpolation_context['_url_'] = uri.to_s
+          interpolation_context['_response_'] = ResponseDrop.new(response)
+          handle_data(response.body, response.env[:url], existing_payload)
+        }
+      end
     rescue => e
       error "Error when fetching url: #{e.message}\n#{e.backtrace.join("\n")}"
+    end
+
+    def get_pg_connection(connection_string)
+      begin
+        need_reconnect = @pg_connection.blank? || @pg_connection_string.blank? ||
+            @pg_connection_string != connection_string || @pg_connection.status != PG::CONNECTION_OK
+        @pg_connection.close if need_reconnect && @pg_connection.present?
+      rescue
+        need_reconnect = true
+      end
+      @pg_connection_string = connection_string
+      @pg_connection = PG.connect(connection_string)
     end
 
     def default_encoding
