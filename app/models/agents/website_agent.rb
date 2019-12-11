@@ -428,8 +428,11 @@ module Agents
       rescue
         need_reconnect = true
       end
-      @pg_connection_string = connection_string
-      @pg_connection = PG.connect(connection_string)
+      if need_reconnect
+        @pg_connection_string = connection_string
+        @pg_connection = PG.connect(connection_string)
+      end
+      @pg_connection
     end
 
     def default_encoding
