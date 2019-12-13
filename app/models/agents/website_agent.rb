@@ -520,7 +520,9 @@ module Agents
     def flush_events(buffer)
       if options['aggregate_events'].present? && options['aggregate_events'] != 'false' && buffer.present?
         log "Creating an aggregated event"
-        create_event payload: {digest: true, events: buffer}
+        digest = {digest: true, events: buffer}
+        digest = digest.merge(options['extra_payload']) if options['extra_payload'].present?
+        create_event payload: digest
       end
     end
 
