@@ -181,6 +181,24 @@ module Agents
 
       In the `on_change` mode, change is detected based on the resulted event payload after applying this option.  If you want to add some keys to each event but ignore any change in them, set `mode` to `all` and put a DeDuplicationAgent downstream. If you want to limit the keys used for the event comparison set uniqueness_keys array.
 
+      Set `aggregate_events` to emit a single digest event:
+
+          {
+            "digest": true,
+            "events": [
+              {
+                "payload": {
+                  ...
+                }
+              },
+              {
+                "payload": {
+                  ...
+                }
+              }
+            ]
+          }
+
       # Liquid Templating
 
       In [Liquid](https://github.com/huginn/huginn/wiki/Formatting-Events-using-Liquid) templating, the following variables are available:
@@ -385,13 +403,14 @@ module Agents
       return unless in_url.present?
 
       post_bodies = Array(in_post_body)
+      events_buffer = []
       Array(in_url).each_with_index { |url, i |
-        check_url(url, post_bodies[i], existing_payload)
+        check_url(url, post_bodies[i], existing_payload, events_buffer)
       }
-
+      flush_events(events_buffer)
     end
 
-    def check_url(url, post_body, existing_payload = {})
+    def check_url(url, post_body, existing_payload = {}, events_buffer)
       uri = Utils.normalize_uri(url)
       log "Fetching #{uri}\n#{post_body}"
       if uri.to_s.start_with?("postgresql://")
@@ -404,7 +423,7 @@ module Agents
         interpolation_context.stack {
           interpolation_context['_url_'] = uri.to_s
           interpolation_context['_response_'] = response
-          handle_data(response[:body].to_json, uri.to_s, existing_payload)
+          handle_data(response[:body].to_json, uri.to_s, existing_payload, events_buffer)
         }
       else
         response = post_body.blank? ? faraday.get(uri) : faraday.post(uri, post_body.is_a?(Hash) ? JSON.generate(post_body) : post_body)
@@ -413,7 +432,7 @@ module Agents
         interpolation_context.stack {
           interpolation_context['_url_'] = uri.to_s
           interpolation_context['_response_'] = ResponseDrop.new(response)
-          handle_data(response.body, response.env[:url], existing_payload)
+          handle_data(response.body, response.env[:url], existing_payload, events_buffer)
         }
       end
     rescue => e
@@ -445,7 +464,7 @@ module Agents
       end
     end
 
-    def handle_data(body, url, existing_payload)
+    def handle_data(body, url, existing_payload, events_buffer)
       # Beware, url may be a URI object, string or nil
 
       doc = parse(body)
@@ -453,9 +472,7 @@ module Agents
       if extract_full_json?
         if store_payload!(previous_payloads(1), doc)
           log "Storing new result for '#{name}': #{doc.inspect}"
-          payload = existing_payload.merge(doc)
-          payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
-          create_event payload: payload
+          emit_event(existing_payload.merge(doc), events_buffer)
         end
         return
       end
@@ -486,10 +503,24 @@ module Agents
 
         if store_payload!(old_events, result)
           log "Storing new parsed result for '#{name}': #{result.inspect}"
-          payload = existing_payload.merge(result)
-          payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
-          create_event payload: payload
+          emit_event(existing_payload.merge(result), events_buffer)
         end
+      end
+    end
+
+    def emit_event(payload, buffer)
+      payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
+      if options['aggregate_events'].present? && options['aggregate_events'] != 'false'
+        buffer << {payload: payload}
+      else
+        create_event payload: payload
+      end
+    end
+
+    def flush_events(buffer)
+      if options['aggregate_events'].present? && options['aggregate_events'] != 'false' && buffer.present?
+        log "Creating an aggregated event"
+        create_event payload: {digest: true, events: buffer}
       end
     end
 
@@ -533,10 +564,12 @@ module Agents
     end
 
     def handle_event_data(data, event, existing_payload)
+      events_buffer = []
       interpolation_context.stack {
         interpolation_context['_response_'] = ResponseFromEventDrop.new(event)
-        handle_data(data, event.payload['url'].presence, existing_payload)
+        handle_data(data, event.payload['url'].presence, existing_payload, events_buffer)
       }
+      flush_events(events_buffer)
     rescue => e
       error "Error when handling event data: #{e.message}\n#{e.backtrace.join("\n")}", inbound_event: event
     end
@@ -547,15 +580,13 @@ module Agents
     def store_payload!(old_events, result)
       case interpolated['mode'].presence
       when 'on_change'
-        result_json = result.to_json
-        if options['uniqueness_keys']
-          found = old_events.find { |event|
-            event.payload.select{ |key| options['uniqueness_keys'].include? key.to_s } ==
-                result.select{ |key| options['uniqueness_keys'].include? key.to_s }
-          }
-        else
-          found = old_events.find { |event| event.payload.to_json == result_json }
-        end
+        found = old_events.find { |event|
+          if event.payload['digest'].present?
+            event.payload['events'].find { |sub_event| is_events_equal(sub_event['payload'], result) }
+          else
+            is_events_equal(event.payload, result)
+          end
+        }
         if found
           found.update!(expires_at: new_event_expiration_date)
           false
@@ -566,6 +597,15 @@ module Agents
         true
       else
         raise "Illegal options[mode]: #{interpolated['mode']}"
+      end
+    end
+
+    def is_events_equal(one, two)
+      if options['uniqueness_keys'].present?
+        one.select{ |key| options['uniqueness_keys'].include? key.to_s } ==
+            two.select{ |key| options['uniqueness_keys'].include? key.to_s }
+      else
+        one.to_json == two.to_json
       end
     end
 
