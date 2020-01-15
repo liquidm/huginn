@@ -226,6 +226,7 @@ module Agents
         error "Invalid method '#{method}'"
       end
 
+      log "Running:\n#{url}\n#{headers}\n#{body}"
       response = faraday.run_request(method.to_sym, url, body, headers) { |request|
         request.params.update(params) if params
       }
