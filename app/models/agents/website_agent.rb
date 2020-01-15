@@ -485,9 +485,12 @@ module Agents
       doc = parse(body)
 
       if extract_full_json?
-        if store_payload!(previous_payloads(1), doc)
-          log "Storing new result for '#{name}': #{doc.inspect}"
-          emit_event(existing_payload.merge(doc), events_buffer)
+        if doc.is_a?(Array)
+          doc.each do |e|
+            emit_event(existing_payload.merge(e), events_buffer) if store_payload!(previous_payloads(1), e)
+          end
+        else
+          emit_event(existing_payload.merge(doc), events_buffer) if store_payload!(previous_payloads(1), doc)
         end
         return
       end
@@ -524,6 +527,7 @@ module Agents
     end
 
     def emit_event(payload, buffer)
+      log "Storing new result for '#{name}': #{payload.inspect}"
       payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
       buffer << {payload: payload}
     end
@@ -531,9 +535,11 @@ module Agents
     def flush_events(buffer)
       return if buffer.blank?
       if options['aggregate_events'].present? && options['aggregate_events'] != 'false'
-        digest = {digest: true, events: buffer}
-        digest = digest.merge(options['digest_extra_payload']) if options['digest_extra_payload'].present?
-        create_event payload: digest
+        buffer.each_slice(interpolated['aggregate_limit'] || 10) do |sub_buffer|
+          digest = {digest: true, events: sub_buffer}
+          digest = digest.merge(options['digest_extra_payload']) if options['digest_extra_payload'].present?
+          create_event payload: digest
+        end
       else
         buffer.each { |e| create_event e }
       end
