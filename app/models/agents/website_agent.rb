@@ -396,7 +396,7 @@ module Agents
     end
 
     def check
-      check_urls(interpolated['url'], interpolated['post_body'])
+      check_urls(interpolated['url'], options['post_body'])
     end
 
     def check_urls(in_url, in_post_body = '', existing_payload = {})
@@ -407,15 +407,30 @@ module Agents
       Array(in_url).each_with_index { |url, i |
         check_url(url, post_bodies[i], existing_payload, events_buffer)
       }
+      events_buffer = compact_events(events_buffer, options['compact_keys']) if options['compact_keys'].present?
       flush_events(events_buffer)
     end
 
     def check_url(url, post_body, existing_payload = {}, events_buffer)
       uri = Utils.normalize_uri(url)
-      log "Fetching #{uri}\n#{post_body}"
+      if uri.to_s.start_with?("postgresql://")
+        query_body = post_body[:query].to_s
+      elsif post_body.present?
+        query_body = post_body.is_a?(Hash) ? JSON.generate(post_body).to_s : post_body
+      else
+        query_body = ''
+      end
+      if query_body.present?
+        interpolation_context.stack {
+          interpolation_context['events_buffer'] = events_buffer.map { |e| e[:payload]}
+          query_body = interpolate_string(query_body)
+        }
+      end
+      log "Fetching #{uri}\n#{query_body}"
+
       if uri.to_s.start_with?("postgresql://")
         response = {status: 200, headers: {}, body: []}
-        get_pg_connection(uri.to_s).exec(post_body[:query]) do |result|
+        get_pg_connection(uri.to_s).exec(query_body) do |result|
           result.each do |row|
             response[:body] << row
           end
@@ -426,7 +441,7 @@ module Agents
           handle_data(response[:body].to_json, uri.to_s, existing_payload, events_buffer)
         }
       else
-        response = post_body.blank? ? faraday.get(uri) : faraday.post(uri, post_body.is_a?(Hash) ? JSON.generate(post_body) : post_body)
+        response = query_body.blank? ? faraday.get(uri) : faraday.post(uri, query_body)
         raise "Failed: #{response.inspect}" unless consider_response_successful?(response)
         log "Response #{response.body}"
         interpolation_context.stack {
@@ -510,20 +525,27 @@ module Agents
 
     def emit_event(payload, buffer)
       payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
-      if options['aggregate_events'].present? && options['aggregate_events'] != 'false'
-        buffer << {payload: payload}
-      else
-        create_event payload: payload
-      end
+      buffer << {payload: payload}
     end
 
     def flush_events(buffer)
-      if options['aggregate_events'].present? && options['aggregate_events'] != 'false' && buffer.present?
-        log "Creating an aggregated event"
+      return if buffer.blank?
+      if options['aggregate_events'].present? && options['aggregate_events'] != 'false'
         digest = {digest: true, events: buffer}
-        digest = digest.merge(options['extra_payload']) if options['extra_payload'].present?
+        digest = digest.merge(options['digest_extra_payload']) if options['digest_extra_payload'].present?
         create_event payload: digest
+      else
+        buffer.each { |e| create_event e }
       end
+    end
+
+    def compact_events(buffer, keys)
+      log "Compacting with #{keys}"
+      return buffer.clone if keys.blank?
+      buffer
+          .map { |event| event[:payload].reject { |key, value| value == 'unknown' } }
+          .group_by { |payload| payload.select { |key, value| keys.include?(key) } }
+          .map { |key, payloads| {payload: payloads.reduce({}, :merge)} }
     end
 
     def receive(incoming_events)
@@ -667,7 +689,9 @@ module Agents
         begin
           output[name] = values
         rescue UnevenSizeError
-          raise "Got an uneven number of matches for #{interpolated['name']}: #{interpolated['extract'].inspect}"
+          if interpolated['allow_unequal_values'].blank?
+            raise "Got an uneven number of matches for #{interpolated['name']}: #{interpolated['extract'].inspect}"
+          end
         else
           output.hidden_keys << name if boolify(extraction_details['hidden'])
         end
