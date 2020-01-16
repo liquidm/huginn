@@ -408,6 +408,7 @@ module Agents
         check_url(url, post_bodies[i], existing_payload, events_buffer)
       }
       events_buffer = compact_events(events_buffer, options['compact_keys']) if options['compact_keys'].present?
+      events_buffer = events_buffer.select {|event| eval(options['filter_callback']) } if options['filter_callback'].present?
       flush_events(events_buffer)
     end
 
@@ -527,7 +528,7 @@ module Agents
     end
 
     def emit_event(payload, buffer)
-      log "Storing new result for '#{name}': #{payload.inspect}"
+      # log "Raw event for '#{name}': #{payload.inspect}"
       payload = payload.merge(options['extra_payload']) if options['extra_payload'].present?
       buffer << {payload: payload}
     end
